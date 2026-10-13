@@ -17,7 +17,7 @@ set -u
 
 ALL="site bot crm game"
 SELECTED="${*:-$ALL}"
-LOGDIR="$HOME/claude-reopen-$(date +%Y%m%d-%H%M%S)"
+LOGDIR="$HOME/claude-reopen-$(date +%Y%m%d-%H%M%S)-$$"
 # Восстановленная игра в репозитории, на случай если исходного файла уже нет.
 GAME_URL="https://raw.githubusercontent.com/ernestdruzinin-glitch/1223/babce759e920559ba36a8fd681e28f4f236a72fb/games/konsumaciya/index.html"
 
@@ -124,6 +124,12 @@ if ! claude_at_least 2.1.259; then
   echo "Claude Code слишком старый ($(claude --version 2>/dev/null | head -1)). Обновите: claude update"
   exit 1
 fi
+# Приложение Claude входит в аккаунт само по себе, а Claude Code в Терминале — отдельно.
+if ! claude auth status >/dev/null 2>&1; then
+  echo "Claude Code в Терминале не вошёл в аккаунт. Выполните: claude auth login"
+  echo "Войдите тем же аккаунтом, что и в приложении Claude, и запустите скрипт снова."
+  exit 1
+fi
 for key in $SELECTED; do
   project_info "$key" || { echo "Неизвестный проект: $key (есть: $ALL)"; exit 2; }
 done
@@ -153,6 +159,8 @@ wait
 
 echo
 if claude_at_least 2.1.285; then CAN_OPEN=1; else CAN_OPEN=0; fi
+CREATED=0
+OPENED=0
 for key in $STARTED; do
   project_info "$key"
   id=$(cat "$LOGDIR/$key.id")
@@ -160,19 +168,33 @@ for key in $STARTED; do
   if [ "$code" = 0 ]; then
     echo "  готово     $NAME"
   else
-    echo "  с ошибкой  $NAME (код $code) — смотрите $LOGDIR/$key.txt"
+    echo "  с ошибкой  $NAME (код $code). Конец журнала $LOGDIR/$key.txt:"
+    tail -5 "$LOGDIR/$key.txt" | sed 's/^/               /'
   fi
+  # Сессия могла сохраниться и после ошибки, например когда кончился лимит ходов.
+  if ! ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$id.jsonl" >/dev/null 2>&1; then
+    echo "             сессия не создана"
+    continue
+  fi
+  CREATED=$((CREATED + 1))
   if [ "$CAN_OPEN" = 1 ]; then
-    ( cd "$DIR" && claude --desktop --resume "$id" ) >> "$LOGDIR/$key.txt" 2>&1 \
-      || echo "             не открылась в приложении. Вручную: cd \"$DIR\" && claude --resume $id, затем /desktop"
+    if ( cd "$DIR" && claude --desktop --resume "$id" ) >> "$LOGDIR/$key.txt" 2>&1; then
+      OPENED=$((OPENED + 1))
+    else
+      echo "             не открылась в приложении. Вручную: cd \"$DIR\" && claude --resume $id, затем /desktop"
+    fi
     sleep 2
   fi
 done
 
 echo
-if [ "$CAN_OPEN" = 1 ]; then
-  echo "Сессии открыты в приложении Claude, каждая в папке своего проекта."
-else
+if [ "$CREATED" = 0 ]; then
+  echo "Ни одна сессия не создана. Пришлите ошибку, которую Claude Code вывел выше."
+  exit 1
+fi
+if [ "$OPENED" -gt 0 ]; then
+  echo "Открыто в приложении Claude: $OPENED из $CREATED, каждая сессия в папке своего проекта."
+elif [ "$CAN_OPEN" = 0 ]; then
   echo "Claude Code старше 2.1.285 и не умеет сам открывать сессии в приложении."
   echo "Обновите его (claude update) и запустите скрипт снова, или в приложении Claude"
   echo "наберите /resume в поле ввода и выберите сессию по названию."
