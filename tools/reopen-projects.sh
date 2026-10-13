@@ -18,6 +18,8 @@ set -u
 ALL="site bot crm game"
 SELECTED="${*:-$ALL}"
 LOGDIR="$HOME/claude-reopen-$(date +%Y%m%d-%H%M%S)-$$"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+PROJECTS_DIR="$CLAUDE_DIR/projects"
 # Восстановленная игра в репозитории, на случай если исходного файла уже нет.
 GAME_URL="https://raw.githubusercontent.com/ernestdruzinin-glitch/1223/babce759e920559ba36a8fd681e28f4f236a72fb/games/konsumaciya/index.html"
 
@@ -95,6 +97,79 @@ new_session_id() {
              @r[0,1,2], ($r[3] & 0x0fff) | 0x4000, ($r[4] & 0x3fff) | 0x8000, @r[5,6,7]'
 }
 
+auth_field() {
+  claude auth status 2>/dev/null | perl -ne 'print $1 if /"'"$1"'"\s*:\s*"([^"]+)"/'
+}
+
+# 0, если Claude Code ходит в API по ключу (кредиты Console), а не по подписке.
+uses_api_key() {
+  case "$(auth_field authMethod)" in api_key|api_key_helper) return 0 ;; esac
+  [ -n "$(auth_field apiKeySource)" ]
+}
+
+# Объясняет, откуда Claude Code в Терминале берёт API-ключ и как перейти на подписку.
+explain_api_key() {
+  local f lines found=0
+  echo "Claude Code в Терминале работает через API-ключ Anthropic Console и платит за запросы"
+  echo "кредитами этого ключа, а не подпиской claude.ai, как приложение Claude. Когда кредиты"
+  echo "кончаются, каждый запуск падает с ошибкой «Credit balance is too low»."
+  echo
+  echo "Источник ключа: $(auth_field apiKeySource)"
+  [ -n "${ANTHROPIC_API_KEY:-}" ] && echo "Ключ задан переменной ANTHROPIC_API_KEY."
+  for f in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv" "$HOME/.bash_profile" \
+           "$HOME/.bashrc" "$HOME/.profile" "$CLAUDE_DIR/settings.json"; do
+    [ -f "$f" ] || continue
+    lines=$(grep -n -E 'ANTHROPIC_API_KEY|apiKeyHelper' "$f" 2>/dev/null | cut -d: -f1 | tr '\n' ' ')
+    [ -n "$lines" ] || continue
+    [ "$found" = 0 ] && echo "Ключ подключается здесь (значение не показываю):"
+    echo "  $f — строки: $lines"
+    found=1
+  done
+  echo
+  echo "Чтобы работать по подписке, как в приложении:"
+  if [ "$found" = 1 ] || [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "  1. В файлах выше поставьте # в начале этих строк и сохраните."
+    echo "  2. Закройте Терминал и откройте новое окно."
+    echo "  3. Выполните: claude auth login — и войдите тем же аккаунтом, что и в приложении Claude."
+  else
+    echo "  1. Выполните: claude auth logout"
+    echo "  2. Выполните: claude auth login — и войдите тем же аккаунтом, что и в приложении Claude."
+  fi
+  echo "  Потом снова: bash ~/reopen.sh"
+  echo
+  echo "Если хотите платить кредитами API, пополните баланс на console.anthropic.com"
+  echo "и запустите так: REOPEN_ALLOW_API_KEY=1 bash ~/reopen.sh"
+}
+
+# 0, если в сессии нет ни одного ответа Claude, кроме сообщений об ошибке API.
+# Такие сессии остаются от запусков, упавших ещё до работы.
+is_empty_session() {
+  ! grep '"type":"assistant"' "$1" | grep -v -e '"isApiErrorMessage":true' -e '"model":"<synthetic>"' \
+      | grep -q .
+}
+
+remove_session() {
+  rm -f "$1"
+  rm -rf "${1%.jsonl}"
+}
+
+# Убирает пустые сессии, созданные прошлыми неудачными запусками этого скрипта.
+cleanup_failed_runs() {
+  local idf id t removed=0
+  for idf in "$HOME"/claude-reopen-*/*.id; do
+    [ -f "$idf" ] || continue
+    [ "$(cat "${idf%.id}.exit" 2>/dev/null)" = 0 ] && continue
+    id=$(cat "$idf")
+    for t in "$PROJECTS_DIR"/*/"$id.jsonl"; do
+      [ -f "$t" ] && is_empty_session "$t" || continue
+      remove_session "$t"
+      removed=$((removed + 1))
+    done
+  done
+  [ "$removed" -gt 0 ] && echo "Убраны пустые сессии от прошлых неудачных запусков: $removed"
+  return 0
+}
+
 # 0, если установленный Claude Code не старше версии в аргументе.
 claude_at_least() {
   claude --version 2>/dev/null | awk -v need="$1" '
@@ -130,6 +205,11 @@ if ! claude auth status >/dev/null 2>&1; then
   echo "Войдите тем же аккаунтом, что и в приложении Claude, и запустите скрипт снова."
   exit 1
 fi
+if uses_api_key && [ -z "${REOPEN_ALLOW_API_KEY:-}" ]; then
+  explain_api_key
+  exit 1
+fi
+cleanup_failed_runs
 for key in $SELECTED; do
   project_info "$key" || { echo "Неизвестный проект: $key (есть: $ALL)"; exit 2; }
 done
@@ -171,17 +251,26 @@ for key in $STARTED; do
     echo "  с ошибкой  $NAME (код $code). Конец журнала $LOGDIR/$key.txt:"
     tail -5 "$LOGDIR/$key.txt" | sed 's/^/               /'
   fi
-  # Сессия могла сохраниться и после ошибки, например когда кончился лимит ходов.
-  if ! ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$id.jsonl" >/dev/null 2>&1; then
+  # Сессия могла сохраниться и после ошибки: с полезной работой, если кончился лимит ходов,
+  # или пустой, если запрос не прошёл. Пустую убираем, чтобы не засоряла список сессий.
+  transcript=""
+  for t in "$PROJECTS_DIR"/*/"$id.jsonl"; do [ -f "$t" ] && transcript="$t"; done
+  if [ -n "$transcript" ] && is_empty_session "$transcript"; then
+    remove_session "$transcript"
+    transcript=""
+  fi
+  if [ -z "$transcript" ]; then
     echo "             сессия не создана"
     continue
   fi
   CREATED=$((CREATED + 1))
   if [ "$CAN_OPEN" = 1 ]; then
-    if ( cd "$DIR" && claude --desktop --resume "$id" ) >> "$LOGDIR/$key.txt" 2>&1; then
+    if ( cd "$DIR" && claude --desktop --resume "$id" ) > "$LOGDIR/$key.desktop.txt" 2>&1; then
       OPENED=$((OPENED + 1))
     else
-      echo "             не открылась в приложении. Вручную: cd \"$DIR\" && claude --resume $id, затем /desktop"
+      echo "             не открылась в приложении:"
+      tail -3 "$LOGDIR/$key.desktop.txt" | sed 's/^/               /'
+      echo "             Вручную: cd \"$DIR\" && claude --resume $id, затем /desktop"
     fi
     sleep 2
   fi
@@ -194,7 +283,9 @@ if [ "$CREATED" = 0 ]; then
 fi
 if [ "$OPENED" -gt 0 ]; then
   echo "Открыто в приложении Claude: $OPENED из $CREATED, каждая сессия в папке своего проекта."
-elif [ "$CAN_OPEN" = 0 ]; then
+elif [ "$CAN_OPEN" = 1 ]; then
+  echo "Сессий создано: $CREATED, но в приложении Claude они не открылись — причина выше."
+else
   echo "Claude Code старше 2.1.285 и не умеет сам открывать сессии в приложении."
   echo "Обновите его (claude update) и запустите скрипт снова, или в приложении Claude"
   echo "наберите /resume в поле ввода и выберите сессию по названию."
