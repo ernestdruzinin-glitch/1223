@@ -306,12 +306,12 @@ for key in $STARTED; do
   fi
   CREATED=$((CREATED + 1))
   if [ "$CAN_OPEN" = 1 ]; then
-    if ( cd "$DIR" && claude --desktop --resume "$id" ) > "$LOGDIR/$key.desktop.txt" 2>&1; then
+    # --desktop отказывается работать с перенаправленным выводом, поэтому пишет прямо в Терминал.
+    if ( cd "$DIR" && claude --desktop --resume "$id" ); then
       OPENED=$((OPENED + 1))
     else
-      echo "             не открылась в приложении:"
-      tail -3 "$LOGDIR/$key.desktop.txt" | sed 's/^/               /'
-      echo "             Вручную: cd \"$DIR\" && claude --resume $id, затем /desktop"
+      echo "             не открылась в приложении (причина выше)."
+      echo "             Вручную: cd \"$DIR\" && claude --desktop --resume $id"
     fi
     sleep 2
   fi
