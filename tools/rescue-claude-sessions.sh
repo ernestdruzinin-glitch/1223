@@ -160,6 +160,12 @@ restore_from_time_machine() {
     else
       echo "tmutil не вернул ни одной копии Time Machine."
     fi
+    if grep -q "No machine directory found" "$list"; then
+      echo "Time Machine не нашла ни одной резервной копии этого Мака: скорее всего, она"
+      echo "не настроена. Проверьте: Системные настройки → Основные → Time Machine."
+      echo "Если диска для копий там нет, удалённые сессии восстановить нельзя."
+      return
+    fi
     echo "Обычно это значит одно из трёх: Time Machine не настроена, диск с копиями"
     echo "не подключён, или у Терминала нет «Полного доступа к диску»"
     echo "(Системные настройки → Конфиденциальность и безопасность → Полный доступ к диску)."
@@ -175,56 +181,64 @@ restore_from_time_machine() {
 
 find_other_copies() {
   section "3б. Копии переписки вне ~/.claude"
-  local copies="$BACKUP/other-copies.txt" found
+  local copies="$BACKUP/other-copies.txt" cowork="$BACKUP/cowork-sessions.txt"
+  local other="$BACKUP/other-session-files.txt"
   : > "$copies"
   while IFS= read -r p; do
     [ -n "$p" ] && [ -d "$p" ] || continue
-    find "$p" -type f -name '*.jsonl' -size +1k 2>/dev/null | while IFS= read -r f; do
-      grep -q -m1 '"sessionId"' "$f" 2>/dev/null && echo "$f" >> "$copies"
-    done
+    find "$p" -type f -name '*.jsonl' -size +1k ! -path '*/subagents/*' 2>/dev/null |
+      while IFS= read -r f; do
+        grep -q -m1 '"sessionId"' "$f" 2>/dev/null && echo "$f" >> "$copies"
+      done
   done <<< "$OTHER_COPIES"
-  found=$(wc -l < "$copies" | tr -d ' ')
-  if [ "$found" = 0 ]; then
+  grep '/local-agent-mode-sessions/' "$copies" > "$cowork"
+  grep -v '/local-agent-mode-sessions/' "$copies" > "$other"
+  if [ ! -s "$copies" ]; then
     echo "Не найдено (смотрели Корзину, ~/_backups и папку приложения Claude)."
     return
   fi
-  head -30 "$copies" | sed 's/^/  /'
-  [ "$found" -gt 30 ] && echo "  … полный список: $copies"
-  echo "Найдено файлов: $found. Это записи сессий Claude Code. Чтобы вернуть сессию, положите"
-  echo "файл в $PROJECTS/<папка проекта>/ и перезапустите приложение."
+  if [ -s "$cowork" ]; then
+    echo "Сессии вкладки Cowork в приложении Claude. Они на месте, переносить их не нужно:"
+    describe_sessions short < "$cowork"
+  fi
+  if [ -s "$other" ]; then
+    [ -s "$cowork" ] && echo
+    echo "Другие записи сессий Claude Code:"
+    describe_sessions full < "$other"
+    echo "Чтобы вернуть такую сессию, положите файл в $PROJECTS/<папка проекта>/"
+    echo "и перезапустите приложение."
+  fi
 }
 
 list_sessions() {
   section "4. Сессии, которые есть на диске (новые сверху)"
   [ -d "$PROJECTS" ] || { echo "Нет папки $PROJECTS."; return; }
+  find "$PROJECTS" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' | describe_sessions full
+}
+
+# Печатает дату и название каждой сессии, новые сверху; в режиме full ещё папку и файл.
+# Пути к файлам сессий приходят на вход, по одному в строке.
+describe_sessions() {
   perl -Mutf8 -MJSON::PP -MPOSIX=strftime -MEncode=decode -e '
-    my ($root) = @ARGV;
+    my $full = $ARGV[0] eq "full";
     my $json = JSON::PP->new->utf8;
     binmode STDOUT, ":utf8";
-    binmode STDERR, ":utf8";
-    my @files;
-    opendir my $top, $root or die "не открыть ", decode("UTF-8", $root), ": $!\n";
-    for my $dir (grep { !/^\./ && -d "$root/$_" } readdir $top) {
-      opendir my $d, "$root/$dir" or next;
-      push @files, map { "$root/$dir/$_" } grep { /\.jsonl$/ } readdir $d;
-      closedir $d;
-    }
-    closedir $top;
     my @rows;
-    for my $f (@files) {
+    while (my $f = <STDIN>) {
+      chomp $f;
       open my $in, "<", $f or next;
       my ($cwd, $title, $first);
       while (my $line = <$in>) {
-        if (!defined $cwd && $line =~ /"cwd":("(?:[^"\\]|\\.)*")/) {
+        if (!defined $cwd && $line =~ /"cwd":\s*("(?:[^"\\]|\\.)*")/) {
           $cwd = eval { $json->decode("[$1]")->[0] };
         }
-        if ($line =~ /"type":"(?:custom-title|ai-title|summary)"/) {
+        if ($line =~ /"type":\s*"(?:custom-title|ai-title|summary)"/) {
           my $o = eval { $json->decode($line) } or next;
           my $t = $o->{customTitle} // $o->{aiTitle} // $o->{title} // $o->{summary};
           $title = $t if defined $t && !($title && $o->{type} eq "summary");
           next;
         }
-        if (!defined $first && $line =~ /"type":"user"/) {
+        if (!defined $first && $line =~ /"type":\s*"user"/) {
           my $o = eval { $json->decode($line) } or next;
           next if $o->{isMeta};
           my $c = $o->{message}{content};
@@ -240,11 +254,11 @@ list_sessions() {
       push @rows, [(stat $f)[9], $cwd // "?", substr($name, 0, 90), decode("UTF-8", $f)];
     }
     for my $r (sort { $b->[0] <=> $a->[0] } @rows) {
-      printf "%s  %s\n    папка: %s\n    файл:  %s\n",
-        strftime("%Y-%m-%d %H:%M", localtime $r->[0]), $r->[2], $r->[1], $r->[3];
+      printf "%s  %s\n", strftime("%Y-%m-%d %H:%M", localtime $r->[0]), $r->[2];
+      printf "    папка: %s\n    файл:  %s\n", $r->[1], $r->[3] if $full;
     }
     printf "Всего сессий: %d\n", scalar @rows;
-  ' "$PROJECTS"
+  ' "$1"
 }
 
 find_projects() {
