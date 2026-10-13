@@ -5,23 +5,27 @@
 #   2. Ставит cleanupPeriodDays = 3650 в ~/.claude/settings.json, чтобы Claude Code
 #      перестал удалять сессии старше 30 дней. Старый файл кладёт в ту же копию.
 #   3. Ищет удалённые сессии в Time Machine и возвращает недостающие. Ничего не перезаписывает.
+#      Ищет копии переписки в Корзине, ~/_backups и папке приложения Claude.
 #   4. Показывает, какие сессии остались и где лежат папки проектов.
 #      Отчёт сохраняется в REPORT.txt внутри папки с копией.
 #
 # Запуск:   bash rescue-claude-sessions.sh
+#           bash rescue-claude-sessions.sh --no-backup     # не копировать историю ещё раз
 #           bash rescue-claude-sessions.sh --no-settings   # не менять settings.json
 #           bash rescue-claude-sessions.sh --no-restore    # не трогать Time Machine
 
 set -u
 
 KEEP_DAYS=3650
+MAKE_BACKUP=1
 CHANGE_SETTINGS=1
 RESTORE=1
 for arg in "$@"; do
   case "$arg" in
+    --no-backup)   MAKE_BACKUP=0 ;;
     --no-settings) CHANGE_SETTINGS=0 ;;
     --no-restore)  RESTORE=0 ;;
-    -h|--help)     sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help)     sed -n '2,17p' "$0"; exit 0 ;;
     *)             echo "Неизвестный параметр: $arg" >&2; exit 2 ;;
   esac
 done
@@ -31,18 +35,33 @@ PROJECTS="$CLAUDE_DIR/projects"
 SETTINGS="$CLAUDE_DIR/settings.json"
 BACKUP="$HOME/claude-sessions-backup-$(date +%Y%m%d-%H%M%S)"
 
-# Папки, которые упоминаются в отчётах прошлых сессий (см. PROJECTS.md).
+# Папки проектов, найденные прошлыми запусками и отчётами (см. PROJECTS.md).
 KNOWN_PLACES="
-$HOME/Downloads/magicui-main
+$HOME/achikol-ohothozyaistvo
 $HOME/ohota-gos
 $HOME/ohota-crm
+$HOME/achikol-content-bot
+$HOME/Downloads/magicui-main
+$HOME/Desktop/сайт
 $HOME/Desktop/Ачикольское_Отобранный_Контент
+"
+
+# Где ещё могли остаться копии переписки.
+OTHER_COPIES="
+$HOME/.Trash
+$HOME/_backups
+$HOME/Library/Application Support/Claude
 "
 
 section() { printf '\n=== %s ===\n' "$1"; }
 
 backup_sessions() {
   section "1. Резервная копия истории сессий"
+  [ -f "$SETTINGS" ] && cp -p "$SETTINGS" "$BACKUP/settings.json.bak"
+  if [ "$MAKE_BACKUP" = 0 ]; then
+    echo "Пропущено (--no-backup)."
+    return
+  fi
   if [ ! -d "$PROJECTS" ]; then
     echo "Папки $PROJECTS нет — копировать нечего."
     return
@@ -52,15 +71,13 @@ backup_sessions() {
   else
     echo "ОШИБКА: копия сделана не полностью, смотрите сообщения выше."
   fi
-  [ -f "$SETTINGS" ] && cp -p "$SETTINGS" "$BACKUP/settings.json.bak"
 }
 
-# Возвращает 0, если после работы функции сессии больше не удаляются через 30 дней.
 set_retention() {
   section "2. Отключение автоудаления сессий"
   if [ "$CHANGE_SETTINGS" = 0 ]; then
     echo "Пропущено (--no-settings)."
-    return 1
+    return
   fi
   mkdir -p "$CLAUDE_DIR"
   if perl -MJSON::PP -e '
@@ -82,10 +99,18 @@ set_retention() {
     ' "$SETTINGS" "$KEEP_DAYS"; then
     echo "В $SETTINGS записано \"cleanupPeriodDays\": $KEEP_DAYS."
     echo "Прежний файл: $BACKUP/settings.json.bak (если он был)."
-    return 0
+  else
+    echo "НЕ получилось. Добавьте в $SETTINGS вручную строку: \"cleanupPeriodDays\": $KEEP_DAYS"
   fi
-  echo "НЕ получилось. Добавьте в $SETTINGS вручную строку: \"cleanupPeriodDays\": $KEEP_DAYS"
-  return 1
+}
+
+# Успех, если в settings.json сейчас стоит срок хранения больше стандартных 30 дней.
+retention_is_off() {
+  [ -f "$SETTINGS" ] && perl -MJSON::PP -e '
+    open my $in, "<", $ARGV[0] or exit 1;
+    my $data = eval { JSON::PP->new->utf8->decode(do { local $/; <$in> }) } or exit 1;
+    exit((($data->{cleanupPeriodDays} // 0) > 30) ? 0 : 1);
+  ' "$SETTINGS"
 }
 
 restore_from_time_machine() {
@@ -94,7 +119,7 @@ restore_from_time_machine() {
     echo "Пропущено (--no-restore)."
     return
   fi
-  if [ "$1" != 0 ]; then
+  if ! retention_is_off; then
     echo "Пропущено: автоудаление не отключено, восстановленные сессии снова удалились бы."
     return
   fi
@@ -102,18 +127,18 @@ restore_from_time_machine() {
     echo "Time Machine на этом компьютере нет."
     return
   fi
-  local backups
-  backups=$(tmutil listbackups 2>/dev/null | sort -r)
-  if [ -z "$backups" ]; then
-    echo "Копий Time Machine не видно: диск не подключён, копий нет,"
-    echo "или Терминалу нужен «Полный доступ к диску» (Настройки → Конфиденциальность)."
-    return
-  fi
-  local rel="${PROJECTS#/}" restored="$BACKUP/restored.txt"
+  local list="$BACKUP/tmutil-listbackups.txt" restored="$BACKUP/restored.txt"
+  local rel="${PROJECTS#/}" total=0 readable=0 with_sessions=0
+  tmutil listbackups > "$list" 2>&1
   : > "$restored"
-  echo "$backups" | while IFS= read -r b; do
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    total=$((total + 1))
+    [ -d "$b" ] || continue
+    readable=$((readable + 1))
     for src in "$b"/*/"$rel" "$b/$rel"; do
       [ -d "$src" ] || continue
+      with_sessions=$((with_sessions + 1))
       ( cd "$src" && find . -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' ) | while IFS= read -r f; do
         f="${f#./}"
         [ -e "$PROJECTS/$f" ] && continue
@@ -126,8 +151,47 @@ restore_from_time_machine() {
         echo "Восстановлено: $f"
       done
     done
-  done
+  done < <(sort -r "$list")
+
+  if [ "$readable" = 0 ]; then
+    if [ -s "$list" ]; then
+      echo "Копии Time Machine прочитать не удалось. Ответ tmutil:"
+      sed 's/^/  /' "$list" | head -5
+    else
+      echo "tmutil не вернул ни одной копии Time Machine."
+    fi
+    echo "Обычно это значит одно из трёх: Time Machine не настроена, диск с копиями"
+    echo "не подключён, или у Терминала нет «Полного доступа к диску»"
+    echo "(Системные настройки → Конфиденциальность и безопасность → Полный доступ к диску)."
+    echo "Исправьте и запустите ещё раз: bash rescue-claude-sessions.sh --no-backup"
+    return
+  fi
+  echo "Копий Time Machine: $total, прочитано: $readable, с папкой сессий: $with_sessions."
+  if [ "$with_sessions" = 0 ]; then
+    echo "Ни в одной копии нет $PROJECTS — эту папку Time Machine не сохраняла."
+  fi
   echo "Восстановлено сессий: $(wc -l < "$restored" | tr -d ' ')."
+}
+
+find_other_copies() {
+  section "3б. Копии переписки вне ~/.claude"
+  local copies="$BACKUP/other-copies.txt" found
+  : > "$copies"
+  while IFS= read -r p; do
+    [ -n "$p" ] && [ -d "$p" ] || continue
+    find "$p" -type f -name '*.jsonl' -size +1k 2>/dev/null | while IFS= read -r f; do
+      grep -q -m1 '"sessionId"' "$f" 2>/dev/null && echo "$f" >> "$copies"
+    done
+  done <<< "$OTHER_COPIES"
+  found=$(wc -l < "$copies" | tr -d ' ')
+  if [ "$found" = 0 ]; then
+    echo "Не найдено (смотрели Корзину, ~/_backups и папку приложения Claude)."
+    return
+  fi
+  head -30 "$copies" | sed 's/^/  /'
+  [ "$found" -gt 30 ] && echo "  … полный список: $copies"
+  echo "Найдено файлов: $found. Это записи сессий Claude Code. Чтобы вернуть сессию, положите"
+  echo "файл в $PROJECTS/<папка проекта>/ и перезапустите приложение."
 }
 
 list_sessions() {
@@ -185,18 +249,20 @@ list_sessions() {
 
 find_projects() {
   section "5. Папки проектов"
-  echo "Известные по прошлым отчётам:"
+  echo "Известные:"
   echo "$KNOWN_PLACES" | while IFS= read -r p; do
     [ -n "$p" ] || continue
     if [ -e "$p" ]; then echo "  есть  $p"; else echo "  НЕТ   $p"; fi
   done
   echo
-  echo "Похожие по названию (поиск в домашней папке, глубина 4):"
+  echo "Похожие по названию (домашняя папка, глубина 4; внутрь найденных папок не заходим):"
   find "$HOME" -maxdepth 4 \
-    \( -path "$HOME/Library" -o -path "$HOME/.Trash" -o -path "$CLAUDE_DIR" \
-       -o -path "$BACKUP" -o -name node_modules -o -name .git \) -prune \
+    \( -path "$HOME/Library" -o -path "$HOME/.Trash" -o -path "$HOME/.ssh" \
+       -o -path "$CLAUDE_DIR" -o -path "$HOME/claude-sessions-backup-*" \
+       -o -name node_modules -o -name .git \) -prune \
     -o \( -iname '*ohota*' -o -iname '*achikol*' -o -iname '*ачикол*' \
-          -o -iname 'magicui*' -o -iname '*konsum*' -o -iname '*консумац*' \) -print \
+          -o -iname 'magicui*' -o -iname '*konsum*' -o -iname '*консумац*' \) \
+       \( -type d -prune -o -true \) -print \
     2>/dev/null | sed 's/^/  /'
 }
 
@@ -204,8 +270,8 @@ main() {
   echo "Копия и отчёт: $BACKUP"
   backup_sessions
   set_retention
-  local retention_ok=$?
-  restore_from_time_machine "$retention_ok"
+  restore_from_time_machine
+  find_other_copies
   list_sessions
   find_projects
   section "Готово"
