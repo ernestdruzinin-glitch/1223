@@ -107,27 +107,34 @@ uses_api_key() {
   [ -n "$(auth_field apiKeySource)" ]
 }
 
-# Объясняет, откуда Claude Code в Терминале берёт API-ключ и как перейти на подписку.
+# Объясняет, откуда Claude Code в Терминале берёт API-ключ. KEY_IN_FILES=1, если ключ
+# задан переменной окружения или в файлах настроек: тогда его надо убрать оттуда вручную.
+KEY_IN_FILES=0
 explain_api_key() {
-  local f lines found=0
+  local f lines
   echo "Claude Code в Терминале работает через API-ключ Anthropic Console и платит за запросы"
   echo "кредитами этого ключа, а не подпиской claude.ai, как приложение Claude. Когда кредиты"
   echo "кончаются, каждый запуск падает с ошибкой «Credit balance is too low»."
   echo
   echo "Источник ключа: $(auth_field apiKeySource)"
-  [ -n "${ANTHROPIC_API_KEY:-}" ] && echo "Ключ задан переменной ANTHROPIC_API_KEY."
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "Ключ задан переменной ANTHROPIC_API_KEY."
+    KEY_IN_FILES=1
+  fi
   for f in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv" "$HOME/.bash_profile" \
            "$HOME/.bashrc" "$HOME/.profile" "$CLAUDE_DIR/settings.json"; do
     [ -f "$f" ] || continue
     lines=$(grep -n -E 'ANTHROPIC_API_KEY|apiKeyHelper' "$f" 2>/dev/null | cut -d: -f1 | tr '\n' ' ')
     [ -n "$lines" ] || continue
-    [ "$found" = 0 ] && echo "Ключ подключается здесь (значение не показываю):"
-    echo "  $f — строки: $lines"
-    found=1
+    echo "Ключ подключается в $f, строки: $lines(значение не показываю)"
+    KEY_IN_FILES=1
   done
+}
+
+print_manual_steps() {
   echo
   echo "Чтобы работать по подписке, как в приложении:"
-  if [ "$found" = 1 ] || [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  if [ "$KEY_IN_FILES" = 1 ]; then
     echo "  1. В файлах выше поставьте # в начале этих строк и сохраните."
     echo "  2. Закройте Терминал и откройте новое окно."
     echo "  3. Выполните: claude auth login — и войдите тем же аккаунтом, что и в приложении Claude."
@@ -139,6 +146,36 @@ explain_api_key() {
   echo
   echo "Если хотите платить кредитами API, пополните баланс на console.anthropic.com"
   echo "и запустите так: REOPEN_ALLOW_API_KEY=1 bash ~/reopen.sh"
+}
+
+# Спрашивает разрешения и переводит Claude Code в Терминале с ключа Console на подписку.
+offer_switch() {
+  local answer
+  echo
+  printf 'Переключить Claude Code в Терминале на подписку прямо сейчас? Откроется браузер. [Д/н] '
+  if ! read -r answer < /dev/tty 2>/dev/null; then
+    echo
+    print_manual_steps
+    return 1
+  fi
+  case "$answer" in
+    ""|д|Д|да|Да|y|Y|yes) ;;
+    *) print_manual_steps; return 1 ;;
+  esac
+  claude auth logout || { print_manual_steps; return 1; }
+  echo "Вход по подписке: в браузере подтвердите вход тем же аккаунтом, что и в приложении Claude."
+  if ! claude auth login; then
+    echo "Вход не завершён."
+    print_manual_steps
+    return 1
+  fi
+  if uses_api_key; then
+    echo "Claude Code всё ещё работает через API-ключ."
+    print_manual_steps
+    return 1
+  fi
+  echo "Готово: Claude Code в Терминале работает по подписке. Продолжаю."
+  echo
 }
 
 # 0, если в сессии нет ни одного ответа Claude, кроме сообщений об ошибке API.
@@ -207,7 +244,11 @@ if ! claude auth status >/dev/null 2>&1; then
 fi
 if uses_api_key && [ -z "${REOPEN_ALLOW_API_KEY:-}" ]; then
   explain_api_key
-  exit 1
+  if [ "$KEY_IN_FILES" = 1 ]; then
+    print_manual_steps
+    exit 1
+  fi
+  offer_switch || exit 1
 fi
 cleanup_failed_runs
 for key in $SELECTED; do
