@@ -1,2 +1,5 @@
 # 1223
-123
+
+- [PROJECTS.md](PROJECTS.md) — где лежат проекты, почему пропали сессии и как продолжить работу.
+- [games/konsumaciya](games/konsumaciya/) — браузерная хоррор-игра «КОНСУМАЦИЯ», восстановлена.
+- [tools/rescue-claude-sessions.sh](tools/rescue-claude-sessions.sh) — скрипт для Мака: резервная копия сессий Claude Code, отключение их автоудаления, восстановление из Time Machine.
